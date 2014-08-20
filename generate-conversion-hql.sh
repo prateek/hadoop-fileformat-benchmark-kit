@@ -1,11 +1,28 @@
 #!/bin/bash
+# currently used against CDH5.1
+
+if [ $# -ne 2 ];
+then
+  echo "Usage: $0 [input-db.]<input-table-name> <output-table-prefix>"
+  exit 1
+fi
+
+INPUT_TABLE=$1
+OUTPUT_TABLE_PREFIX=$2
+
+BASE_SCHEMA_NAME=$(date +%s)-BenchmarkSchema.avsc
+SCHEMA_FILE=$(mktemp -d)/$BASE_SCHEMA_NAME
+
+echo "Schema-file: $SCHEMA_FILE"
+./generate-avro-schema.py $INPUT_TABLE > $SCHEMA_FILE
+
+hdfs dfs -put $SCHEMA_FILE /tmp/$BASE_SCHEMA_NAME
 
 ## TODO: this relies on bash4 for the associative arrays
 ## TODO: Extract out to have a better configuration framework
 ## TODO: do testing based on CDH deployment version,
 ##      i.e. each framework supports different fileformats and compressions
 ##           at different times. Make the configuration be version specific
-
 declare -A TABLE_TYPES
 TABLE_TYPES=( \
 ["csv"]="STORED AS TEXTFILE"     \
@@ -16,32 +33,30 @@ ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.avro.AvroSerDe'
 STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat'
 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat'
 TBLPROPERTIES (
-  'avro.schema.url'='hdfs:///user/f557905/curves_schema.avsc');
+  'avro.schema.url'='hdfs:///tmp/$BASE_SCHEMA_NAME');
 EOF
-## TODO: ^ make avro schema generation be dynamic
 ) \
 ## TODO: make parquet query generation be dynamic
-## TODO: (!) `Create Table AS` should be fixed with PARQUET, file the jira and fix
-["parquet"]=$(cat ./parquet-table-snippet.hql)
+["parquet"]="STORED AS PARQUET" \
 )
 
 declare -A INSERT_APPEND
 INSERT_APPEND=( \
-["csv"]="AS SELECT * FROM raw_data;" \
-["rc"]="AS SELECT * FROM raw_data;"  \
-["seq"]="AS SELECT * FROM raw_data;" \
-["avro"]=$(cat <<"EOF"
+["csv"]="AS SELECT * FROM $INPUT_TABLE;" \
+["rc"]="AS SELECT * FROM $INPUT_TABLE;"  \
+["seq"]="AS SELECT * FROM $INPUT_TABLE;" \
+["avro"]=$(cat <<EOF
 
 INSERT OVERWRITE TABLE TABLE_NAME
 SELECT * FROM
-raw_data;
+$INPUT_TABLE;
 EOF
 ) \
-["parquet"]=$(cat <<"EOF"
+["parquet"]=$(cat <<EOF
 
 INSERT OVERWRITE TABLE TABLE_NAME
 SELECT * FROM
-raw_data;
+$INPUT_TABLE;
 EOF
 ) \
 )
@@ -110,6 +125,8 @@ EOF
 ) \
 )
 
+mkdir -p ./generated-queries
+
 for tt in "${!TABLE_TYPES[@]}"
 do
 
@@ -118,11 +135,13 @@ IFS=' ' read -a supported_codecs <<< "${COMPATIBLE_CODECS[$tt]}"
 for co in "${supported_codecs[@]}"
 do
 
-table_name=${tt}_${co}
-(cat - | sed "s/TABLE_NAME/${table_name}/g" | tee ./curve-gen/$table_name.hql ) <<EOF
+table_name=$OUTPUT_TABLE_PREFIX_${tt}_${co}
+(cat - | sed "s/TABLE_NAME/${table_name}/g" | tee ./generated-queries/$table_name.hql ) <<EOF
 
 -- FORMAT: $tt, COMPRESSION: $co
-USE masvit_curves;
+
+CREATE DATABASE IF NOT EXISTS fileformat_benchmark;
+USE fileformat_benchmark;
 
 -- SET COMPRESSION
 ${COMPRESSION["$co"]}
